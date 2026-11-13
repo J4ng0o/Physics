@@ -1,0 +1,16 @@
+name: PhysicsRod
+version: 1.0.0
+main: com.example.physicsrod.PhysicsRodPlugin
+api-version: '1.21'
+commands:
+  physrod:
+    description: Give yourself the Physics Rod
+    usage: /physrod
+    permission: physicsrod.give
+permissions:
+  physicsrod.give:
+    description: Allows using /physrod
+    default: op
+  physicsrod.use:
+    description: Allows making blocks physical
+    default: op
