@@ -25,9 +25,6 @@ public class PhysicsListener implements Listener {
 
     private final Map<UUID, PhysicsBlock> activeBlocks = new HashMap<>();
     private final Map<UUID, UUID> grabbedByPlayer = new HashMap<>();
-    
-    // Храним задачи для ActionBar, чтобы не спамить чат
-    private final Map<UUID, BukkitRunnable> actionBarTasks = new HashMap<>();
 
     private static final double GRAVITY = -0.045;
     private static final double AIR_DRAG = 0.998;
@@ -48,13 +45,8 @@ public class PhysicsListener implements Listener {
         }
         activeBlocks.clear();
         grabbedByPlayer.clear();
-        for (BukkitRunnable task : actionBarTasks.values()) {
-            task.cancel();
-        }
-        actionBarTasks.clear();
     }
 
-    // Задача для отображения подсказок над инвентарём
     private void startActionBarTask() {
         new BukkitRunnable() {
             @Override
@@ -73,7 +65,7 @@ public class PhysicsListener implements Listener {
                     }
                 }
             }
-        }.runTaskTimer(plugin, 0L, 10L); // Обновляем каждые полсекунды
+        }.runTaskTimer(plugin, 0L, 10L);
     }
 
     @EventHandler(priority = EventPriority.LOWEST)
@@ -86,7 +78,6 @@ public class PhysicsListener implements Listener {
         UUID playerId = player.getUniqueId();
         Action action = event.getAction();
 
-        // Бросок или отпускание (ЛКМ и ПКМ в воздухе или по блоку)
         if (action == Action.LEFT_CLICK_AIR || action == Action.LEFT_CLICK_BLOCK) {
             if (grabbedByPlayer.containsKey(playerId)) {
                 event.setCancelled(true);
@@ -126,7 +117,7 @@ public class PhysicsListener implements Listener {
             return;
         }
 
-        Location spawnLoc = clickedBlock.getLocation().add(0.5, 0.5, 0.5);
+        Location spawnLoc = clickedBlock.getLocation().add(0.5, 0, 0.5);
         Material type = clickedBlock.getType();
 
         for (PhysicsBlock pb : activeBlocks.values()) {
@@ -190,7 +181,9 @@ public class PhysicsListener implements Listener {
         World world = loc.getWorld();
         BlockDisplay display = world.spawn(loc, BlockDisplay.class, entity -> {
             entity.setBlock(type.createBlockData());
+            // Центрируем дисплей и применяем масштаб
             Transformation t = entity.getTransformation();
+            t.getTranslation().set(new Vector3f(-0.5f, 0f, -0.5f)); // Сдвигаем так, чтобы центр блока совпадал с локацией
             t.getScale().set(new Vector3f(BLOCK_SCALE, BLOCK_SCALE, BLOCK_SCALE));
             entity.setTransformation(t);
             entity.setTeleportDuration(1);
@@ -230,11 +223,12 @@ public class PhysicsListener implements Listener {
             return grabbed;
         }
 
+        // Хитбокс строится от центра локации, так как мы скомпенсировали смещение трансформацией
         BoundingBox getBoundingBox(Location loc) {
             double half = 0.49;
             return new BoundingBox(
-                    loc.getX() - half, loc.getY() - half, loc.getZ() - half,
-                    loc.getX() + half, loc.getY() + half, loc.getZ() + half
+                    loc.getX() - half, loc.getY(), loc.getZ() - half,
+                    loc.getX() + half, loc.getY() + 1.0, loc.getZ() + half
             );
         }
 
@@ -270,7 +264,7 @@ public class PhysicsListener implements Listener {
 
             Location eye = holder.getEyeLocation();
             Vector dir = eye.getDirection().normalize();
-            Location target = eye.clone().add(dir.multiply(GRAB_DISTANCE));
+            Location target = eye.clone().add(dir.multiply(GRAB_DISTANCE)).subtract(0, 0.5, 0); // Смещение чтобы блок был по центру взгляда
 
             Vector delta = target.toVector().subtract(loc.toVector());
             double dist = delta.length();
@@ -300,7 +294,7 @@ public class PhysicsListener implements Listener {
 
             Vector move = velocity.clone();
 
-            // Проверка по Y (вверх/вниз)
+            // Проверка по Y
             if (move.getY() != 0) {
                 Location testY = loc.clone().add(0, move.getY(), 0);
                 if (collides(testY)) {
@@ -368,19 +362,18 @@ public class PhysicsListener implements Listener {
             World world = testLoc.getWorld();
             BoundingBox box = getBoundingBox(testLoc);
 
-            // Расширяем границы поиска блоков на 1, чтобы точно захватить все возможные пересечения
-            int minX = (int) Math.floor(box.getMinX()) - 1;
-            int minY = (int) Math.floor(box.getMinY()) - 1;
-            int minZ = (int) Math.floor(box.getMinZ()) - 1;
-            int maxX = (int) Math.floor(box.getMaxX()) + 1;
-            int maxY = (int) Math.floor(box.getMaxY()) + 1;
-            int maxZ = (int) Math.floor(box.getMaxZ()) + 1;
+            int minX = (int) Math.floor(box.getMinX());
+            int minY = (int) Math.floor(box.getMinY());
+            int minZ = (int) Math.floor(box.getMinZ());
+            int maxX = (int) Math.floor(box.getMaxX());
+            int maxY = (int) Math.floor(box.getMaxY());
+            int maxZ = (int) Math.floor(box.getMaxZ());
 
             for (int x = minX; x <= maxX; x++) {
                 for (int y = minY; y <= maxY; y++) {
                     for (int z = minZ; z <= maxZ; z++) {
                         Block b = world.getBlockAt(x, y, z);
-                        if (!b.getType().isAir() && b.getType().isSolid()) {
+                        if (b.getType().isSolid()) {
                             BoundingBox blockBox = b.getBoundingBox();
                             if (blockBox.overlaps(box)) return true;
                         }
