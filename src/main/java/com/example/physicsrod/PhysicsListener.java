@@ -118,7 +118,6 @@ public class PhysicsListener implements Listener {
             return;
         }
 
-        // Используем точный центр блока для спавна
         Location spawnLoc = clickedBlock.getLocation().add(0.5, 0.5, 0.5);
         Material type = clickedBlock.getType();
 
@@ -187,9 +186,9 @@ public class PhysicsListener implements Listener {
         
         BlockDisplay display = world.spawn(loc, BlockDisplay.class, entity -> {
             entity.setBlock(data);
-            // Инициализируем трансформацию с учетом смещения
+            // ВАЖНО: применяем масштаб и сдвиг для центрирования
             Transformation t = entity.getTransformation();
-            t.getTranslation().set(new Vector3f(-0.5f, -0.5f, -0.5f)); // Сдвиг к центру
+            t.getTranslation().set(new Vector3f(-0.5f, -0.5f, -0.5f));
             t.getScale().set(new Vector3f(BLOCK_SCALE, BLOCK_SCALE, BLOCK_SCALE));
             entity.setTransformation(t);
             entity.setTeleportDuration(1);
@@ -235,12 +234,12 @@ public class PhysicsListener implements Listener {
         }
 
         Location getCenterLocation() {
-            return display.getLocation(); // display.getLocation() возвращает центр, так как мы применили смещение трансформацией
+            return display.getLocation();
         }
 
+        // Хитбокс строится от центра (loc)
         BoundingBox getBoundingBox(Location loc) {
             double half = 0.49;
-            // Возвращаем AABB, который всегда 1x1x1, но мы будем проверять его на пересечение с блоками
             return new BoundingBox(
                     loc.getX() - half, loc.getY() - half, loc.getZ() - half,
                     loc.getX() + half, loc.getY() + half, loc.getZ() + half
@@ -292,11 +291,12 @@ public class PhysicsListener implements Listener {
             Location newLoc = loc.clone().add(delta);
             display.teleport(newLoc);
 
-            // Поворот блока вслед за взглядом
+            // Вращение вокруг центра (используем локальные оси)
             float yaw = holder.getLocation().getYaw();
             float pitch = holder.getLocation().getPitch();
             
             Transformation t = display.getTransformation();
+            // Поворачиваем кватернион: сначала Y (yaw), затем X (pitch)
             Quaternionf quat = new Quaternionf()
                     .rotateY((float) Math.toRadians(-yaw))
                     .rotateX((float) Math.toRadians(pitch));
@@ -315,13 +315,11 @@ public class PhysicsListener implements Listener {
 
             Vector move = velocity.clone();
 
-            // Проверка по Y
             if (move.getY() != 0) {
                 Location testY = loc.clone().add(0, move.getY(), 0);
                 if (collides(testY)) {
                     if (move.getY() < 0) {
                         onGround = true;
-                        // Расчет опрокидывания, если упал на край
                         calculateTipping(testY);
                     }
                     velocity.setY(-velocity.getY() * BOUNCE);
@@ -332,7 +330,6 @@ public class PhysicsListener implements Listener {
                 }
             }
 
-            // Проверка по X
             if (move.getX() != 0) {
                 Location testX = loc.clone().add(move.getX(), 0, 0);
                 if (collides(testX)) {
@@ -343,7 +340,6 @@ public class PhysicsListener implements Listener {
                 }
             }
 
-            // Проверка по Z
             if (move.getZ() != 0) {
                 Location testZ = loc.clone().add(0, 0, move.getZ());
                 if (collides(testZ)) {
@@ -365,12 +361,10 @@ public class PhysicsListener implements Listener {
 
             display.teleport(loc);
 
-            // Применяем вращение
             if (Math.abs(rotationSpeedPitch) > 0.01f || Math.abs(rotationSpeedRoll) > 0.01f) {
                 rotationPitch += rotationSpeedPitch;
                 rotationRoll += rotationSpeedRoll;
                 
-                // Ограничиваем углы
                 if (rotationPitch > 90f) { rotationPitch = 90f; rotationSpeedPitch = 0; }
                 if (rotationPitch < -90f) { rotationPitch = -90f; rotationSpeedPitch = 0; }
                 if (rotationRoll > 90f) { rotationRoll = 90f; rotationSpeedRoll = 0; }
@@ -389,16 +383,13 @@ public class PhysicsListener implements Listener {
         }
 
         private void calculateTipping(Location loc) {
-            // Проверяем, есть ли блок под центром.
-            // Если под центром пусто, а под краем есть — блок должен упасть на бок.
             World world = loc.getWorld();
             Block centerBlock = world.getBlockAt(loc.clone().subtract(0, 0.5, 0));
             
             if (centerBlock.getType().isAir()) {
-                // Блок висит на краю. Добавляем случайный наклон, чтобы он упал
                 rotationSpeedPitch = (float) (Math.random() * 0.2 - 0.1);
                 rotationSpeedRoll = (float) (Math.random() * 0.2 - 0.1);
-                velocity.setY(-0.1); // Толкаем вниз
+                velocity.setY(-0.1);
             }
         }
 
