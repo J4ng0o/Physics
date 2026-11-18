@@ -2,6 +2,7 @@ package com.example.physicsrod;
 
 import org.bukkit.*;
 import org.bukkit.block.Block;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.BlockDisplay;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -30,7 +31,7 @@ public class PhysicsListener implements Listener {
     private static final double AIR_DRAG = 0.998;
     private static final double GROUND_FRICTION = 0.85;
     private static final double BOUNCE = 0.35;
-    private static final double GRAB_DISTANCE = 4.0;
+    private static final double GRAB_DISTANCE = 5.0;
     private static final double MAX_SPEED = 2.0;
     private static final float BLOCK_SCALE = 0.98f;
 
@@ -141,17 +142,19 @@ public class PhysicsListener implements Listener {
         Vector dir = eye.getDirection().normalize();
         PhysicsBlock best = null;
         double bestDist = GRAB_DISTANCE;
+        double bestDot = 0.85;
 
         for (PhysicsBlock pb : activeBlocks.values()) {
             if (pb.isGrabbed()) continue;
-            Location loc = pb.display.getLocation();
+            Location loc = pb.getCenterLocation();
             Vector toBlock = loc.clone().subtract(eye).toVector();
             double dist = toBlock.length();
             if (dist > bestDist) continue;
             double dot = toBlock.normalize().dot(dir);
-            if (dot > 0.75) {
+            if (dot > bestDot) {
                 best = pb;
                 bestDist = dist;
+                bestDot = dot;
             }
         }
         return best;
@@ -179,11 +182,12 @@ public class PhysicsListener implements Listener {
 
     private PhysicsBlock createPhysicsBlock(Location loc, Material type, UUID owner) {
         World world = loc.getWorld();
+        BlockData data = type.createBlockData();
+        
         BlockDisplay display = world.spawn(loc, BlockDisplay.class, entity -> {
-            entity.setBlock(type.createBlockData());
-            // Центрируем дисплей и применяем масштаб
+            entity.setBlock(data);
             Transformation t = entity.getTransformation();
-            t.getTranslation().set(new Vector3f(-0.5f, 0f, -0.5f)); // Сдвигаем так, чтобы центр блока совпадал с локацией
+            t.getTranslation().set(new Vector3f(-0.5f, 0f, -0.5f));
             t.getScale().set(new Vector3f(BLOCK_SCALE, BLOCK_SCALE, BLOCK_SCALE));
             entity.setTransformation(t);
             entity.setTeleportDuration(1);
@@ -194,7 +198,7 @@ public class PhysicsListener implements Listener {
             entity.setInterpolationDelay(0);
         });
 
-        PhysicsBlock pb = new PhysicsBlock(display, type, owner);
+        PhysicsBlock pb = new PhysicsBlock(display, type, data, owner);
         pb.start();
         return pb;
     }
@@ -203,6 +207,7 @@ public class PhysicsListener implements Listener {
         final UUID uuid = UUID.randomUUID();
         final BlockDisplay display;
         final Material material;
+        final BlockData blockData;
         final UUID owner;
         BukkitRunnable task;
 
@@ -213,9 +218,10 @@ public class PhysicsListener implements Listener {
         boolean grabbed = false;
         UUID grabbedBy = null;
 
-        PhysicsBlock(BlockDisplay display, Material material, UUID owner) {
+        PhysicsBlock(BlockDisplay display, Material material, BlockData blockData, UUID owner) {
             this.display = display;
             this.material = material;
+            this.blockData = blockData;
             this.owner = owner;
         }
 
@@ -223,7 +229,10 @@ public class PhysicsListener implements Listener {
             return grabbed;
         }
 
-        // Хитбокс строится от центра локации, так как мы скомпенсировали смещение трансформацией
+        Location getCenterLocation() {
+            return display.getLocation().add(0, 0.5, 0);
+        }
+
         BoundingBox getBoundingBox(Location loc) {
             double half = 0.49;
             return new BoundingBox(
@@ -264,7 +273,7 @@ public class PhysicsListener implements Listener {
 
             Location eye = holder.getEyeLocation();
             Vector dir = eye.getDirection().normalize();
-            Location target = eye.clone().add(dir.multiply(GRAB_DISTANCE)).subtract(0, 0.5, 0); // Смещение чтобы блок был по центру взгляда
+            Location target = eye.clone().add(dir.multiply(GRAB_DISTANCE)).subtract(0, 0.5, 0);
 
             Vector delta = target.toVector().subtract(loc.toVector());
             double dist = delta.length();
@@ -294,7 +303,6 @@ public class PhysicsListener implements Listener {
 
             Vector move = velocity.clone();
 
-            // Проверка по Y
             if (move.getY() != 0) {
                 Location testY = loc.clone().add(0, move.getY(), 0);
                 if (collides(testY)) {
@@ -313,7 +321,6 @@ public class PhysicsListener implements Listener {
                 }
             }
 
-            // Проверка по X
             if (move.getX() != 0) {
                 Location testX = loc.clone().add(move.getX(), 0, 0);
                 if (collides(testX)) {
@@ -324,7 +331,6 @@ public class PhysicsListener implements Listener {
                 }
             }
 
-            // Проверка по Z
             if (move.getZ() != 0) {
                 Location testZ = loc.clone().add(0, 0, move.getZ());
                 if (collides(testZ)) {
@@ -410,7 +416,7 @@ public class PhysicsListener implements Listener {
             for (int dy = 0; dy <= 3; dy++) {
                 Block target = world.getBlockAt(bx, by + dy, bz);
                 if (target.getType().isAir() || !target.getType().isSolid()) {
-                    target.setType(material);
+                    target.setBlockData(blockData, false);
                     break;
                 }
             }
