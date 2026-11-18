@@ -27,13 +27,17 @@ public class PhysicsListener implements Listener {
     private final Map<UUID, PhysicsBlock> activeBlocks = new HashMap<>();
     private final Map<UUID, UUID> grabbedByPlayer = new HashMap<>();
 
-    private static final double GRAVITY = -0.045;
-    private static final double AIR_DRAG = 0.998;
-    private static final double GROUND_FRICTION = 0.85;
-    private static final double BOUNCE = 0.35;
+    private static final double GRAVITY = -0.05;
+    private static final double AIR_DRAG = 0.995;
+    private static final double GROUND_FRICTION = 0.7;
+    private static final double RESTITUTION = 0.25; // Упругость (0 - пластик, 1 - резина)
     private static final double GRAB_DISTANCE = 5.0;
-    private static final double MAX_SPEED = 2.0;
-    private static final float BLOCK_SCALE = 0.98f;
+    private static final double MAX_SPEED = 3.0;
+    private static final float BLOCK_SCALE = 1.0f;
+    
+    // Параметры физики
+    private static final double ANGULAR_DAMPING = 0.96;
+    private static final double INERTIA_FACTOR = 0.5;
 
     public PhysicsListener(PhysicsRodPlugin plugin) {
         this.plugin = plugin;
@@ -173,10 +177,17 @@ public class PhysicsListener implements Listener {
         grabbedByPlayer.remove(player.getUniqueId());
 
         if (throwIt) {
-            Vector dir = player.getEyeLocation().getDirection().normalize().multiply(1.6);
-            pb.velocity = dir.add(new Vector(0, 0.15, 0));
+            Vector dir = player.getEyeLocation().getDirection().normalize().multiply(1.8);
+            pb.velocity = dir.add(new Vector(0, 0.2, 0));
+            // Добавляем угловой момент при броске
+            pb.angularVelocity = new Vector(
+                    (Math.random() - 0.5) * 0.2,
+                    (Math.random() - 0.5) * 0.2,
+                    (Math.random() - 0.5) * 0.2
+            );
         } else {
             pb.velocity = new Vector(0, 0, 0);
+            pb.angularVelocity = new Vector(0, 0, 0);
         }
     }
 
@@ -187,16 +198,15 @@ public class PhysicsListener implements Listener {
         BlockDisplay display = world.spawn(loc, BlockDisplay.class, entity -> {
             entity.setBlock(data);
             Transformation t = entity.getTransformation();
-            // Сдвигаем модель так, чтобы центр вращения был в центре блока
+            // Центрируем модель
             t.getTranslation().set(new Vector3f(-0.5f, -0.5f, -0.5f));
             t.getScale().set(new Vector3f(BLOCK_SCALE, BLOCK_SCALE, BLOCK_SCALE));
             entity.setTransformation(t);
-            entity.setTeleportDuration(1);
+            entity.setTeleportDuration(0); // Мгновенное обновление для физики
             entity.setGravity(false);
             entity.setInvulnerable(true);
             entity.setPersistent(false);
-            entity.setInterpolationDuration(1);
-            entity.setInterpolationDelay(0);
+            entity.setInterpolationDuration(0);
         });
 
         PhysicsBlock pb = new PhysicsBlock(display, type, data, owner);
@@ -213,20 +223,22 @@ public class PhysicsListener implements Listener {
         BukkitRunnable task;
 
         Vector velocity = new Vector(0, 0, 0);
-        float rotationPitch = 0f;
-        float rotationRoll = 0f;
-        float rotationSpeedPitch = 0f;
-        float rotationSpeedRoll = 0f;
+        Vector angularVelocity = new Vector(0, 0, 0); // Угловая скорость (X, Y, Z)
+        Quaternionf rotation = new Quaternionf(); // Текущий поворот
         
         boolean onGround = false;
         boolean grabbed = false;
         UUID grabbedBy = null;
+        
+        // Для синхронизации визуала
+        Location currentLoc;
 
         PhysicsBlock(BlockDisplay display, Material material, BlockData blockData, UUID owner) {
             this.display = display;
             this.material = material;
             this.blockData = blockData;
             this.owner = owner;
+            this.currentLoc = display.getLocation();
         }
 
         boolean isGrabbed() {
@@ -237,9 +249,9 @@ public class PhysicsListener implements Listener {
             return display.getLocation();
         }
 
-        // Физический хитбокс всегда ровный, независимо от визуального поворота
         BoundingBox getBoundingBox(Location loc) {
-            double half = 0.49;
+            // Хитбокс всегда 1x1x1, независимо от визуального поворота, для стабильной физики
+            double half = 0.5;
             return new BoundingBox(
                     loc.getX() - half, loc.getY() - half, loc.getZ() - half,
                     loc.getX() + half, loc.getY() + half, loc.getZ() + half
@@ -256,19 +268,17 @@ public class PhysicsListener implements Listener {
                         return;
                     }
 
-                    Location loc = display.getLocation();
-
                     if (grabbed) {
-                        handleGrab(loc);
+                        handleGrab();
                     } else {
-                        handlePhysics(loc);
+                        handlePhysics();
                     }
                 }
             };
             task.runTaskTimer(plugin, 0L, 1L);
         }
 
-        private void handleGrab(Location loc) {
+        private void handleGrab() {
             Player holder = Bukkit.getPlayer(grabbedBy);
             if (holder == null || !holder.isOnline()) {
                 grabbed = false;
@@ -280,7 +290,7 @@ public class PhysicsListener implements Listener {
             Vector dir = eye.getDirection().normalize();
             Location target = eye.clone().add(dir.multiply(GRAB_DISTANCE));
 
-            Vector delta = target.toVector().subtract(loc.toVector());
+            Vector delta = target.toVector().subtract(currentLoc.toVector());
             double dist = delta.length();
             if (dist > MAX_SPEED) {
                 delta.normalize().multiply(MAX_SPEED);
@@ -288,136 +298,85 @@ public class PhysicsListener implements Listener {
                 delta.multiply(0.55);
             }
 
-            Location newLoc = loc.clone().add(delta);
-            display.teleport(newLoc);
+            currentLoc.add(delta);
+            display.teleport(currentLoc);
 
-            // При захвате блок поворачивается за взглядом
+            // Поворот за взглядом
             float yaw = holder.getLocation().getYaw();
             float pitch = holder.getLocation().getPitch();
             
-            Transformation t = display.getTransformation();
-            Quaternionf quat = new Quaternionf()
+            Quaternionf targetRot = new Quaternionf()
                     .rotateY((float) Math.toRadians(-yaw))
                     .rotateX((float) Math.toRadians(pitch));
-            t.getLeftRotation().set(quat);
-            display.setTransformation(t);
-
+            
+            // Плавная интерполяция поворота
+            rotation.slerp(targetRot, 0.4f);
+            
+            updateTransformation();
             velocity = delta.multiply(0.6);
         }
 
-        private void handlePhysics(Location loc) {
+        private void handlePhysics() {
+            // 1. Гравитация
             velocity.setY(velocity.getY() + GRAVITY);
 
+            // 2. Ограничение скорости
             if (velocity.length() > MAX_SPEED * 1.5) {
                 velocity.normalize().multiply(MAX_SPEED * 1.5);
             }
 
+            // 3. Применение скорости
             Vector move = velocity.clone();
+            Location nextLoc = currentLoc.clone().add(move);
 
-            if (move.getY() != 0) {
-                Location testY = loc.clone().add(0, move.getY(), 0);
-                if (collides(testY)) {
-                    if (move.getY() < 0) {
-                        onGround = true;
-                        calculateTipping(testY);
-                    }
-                    velocity.setY(-velocity.getY() * BOUNCE);
-                    if (Math.abs(velocity.getY()) < 0.08) velocity.setY(0);
-                } else {
-                    loc.add(0, move.getY(), 0);
-                    onGround = false;
-                }
-            }
-
-            if (move.getX() != 0) {
-                Location testX = loc.clone().add(move.getX(), 0, 0);
-                if (collides(testX)) {
-                    velocity.setX(-velocity.getX() * BOUNCE);
-                    if (Math.abs(velocity.getX()) < 0.05) velocity.setX(0);
-                } else {
-                    loc.add(move.getX(), 0, 0);
-                }
-            }
-
-            if (move.getZ() != 0) {
-                Location testZ = loc.clone().add(0, 0, move.getZ());
-                if (collides(testZ)) {
-                    velocity.setZ(-velocity.getZ() * BOUNCE);
-                    if (Math.abs(velocity.getZ()) < 0.05) velocity.setZ(0);
-                } else {
-                    loc.add(0, 0, move.getZ());
-                }
-            }
-
-            if (onGround) {
+            // 4. Разрешение коллизий (Collision Resolution)
+            boolean collided = resolveCollisions(nextLoc);
+            
+            if (collided) {
+                onGround = true;
                 velocity.setX(velocity.getX() * GROUND_FRICTION);
                 velocity.setZ(velocity.getZ() * GROUND_FRICTION);
-                if (Math.abs(velocity.getX()) < 0.02) velocity.setX(0);
-                if (Math.abs(velocity.getZ()) < 0.02) velocity.setZ(0);
+                
+                // Затухание вращения на земле
+                angularVelocity.multiply(0.9);
+                
+                // Если скорость очень мала, останавливаем
+                if (velocity.lengthSquared() < 0.001) {
+                    velocity = new Vector(0, 0, 0);
+                }
+                if (angularVelocity.lengthSquared() < 0.001) {
+                    angularVelocity = new Vector(0, 0, 0);
+                    // Финальное выравнивание при остановке
+                    snapRotation();
+                }
             } else {
+                onGround = false;
                 velocity.multiply(AIR_DRAG);
+                angularVelocity.multiply(ANGULAR_DAMPING);
             }
 
-            display.teleport(loc);
+            currentLoc = nextLoc;
+            display.teleport(currentLoc);
 
-            // --- ЛОГИКА ВРАЩЕНИЯ И ПРИЛИПАНИЯ ---
-            if (Math.abs(rotationSpeedPitch) > 0.01f || Math.abs(rotationSpeedRoll) > 0.01f) {
-                rotationPitch += rotationSpeedPitch;
-                rotationRoll += rotationSpeedRoll;
-                
-                if (rotationPitch > 90f) { rotationPitch = 90f; rotationSpeedPitch = 0; }
-                if (rotationPitch < -90f) { rotationPitch = -90f; rotationSpeedPitch = 0; }
-                if (rotationRoll > 90f) { rotationRoll = 90f; rotationSpeedRoll = 0; }
-                if (rotationRoll < -90f) { rotationRoll = -90f; rotationSpeedRoll = 0; }
-                
-                rotationSpeedPitch *= 0.92f;
-                rotationSpeedRoll *= 0.92f;
-            } else if (onGround) {
-                // Если скорость вращения упала, а блок на земле — принудительно выравниваем его
-                rotationPitch = snapRotation(rotationPitch);
-                rotationRoll = snapRotation(rotationRoll);
-            }
-
-            // Применяем вращение с правильным центром
-            Transformation t = display.getTransformation();
-            Quaternionf quat = new Quaternionf()
-                    .rotateX((float) Math.toRadians(rotationPitch))
-                    .rotateZ((float) Math.toRadians(rotationRoll));
-            t.getLeftRotation().set(quat);
-            
-            // ВАЖНО: корректируем смещение, чтобы блок не улетал при вращении
-            Vector3f offset = new Vector3f(-0.5f, -0.5f, -0.5f);
-            quat.transform(offset);
-            t.getTranslation().set(offset);
-            
-            display.setTransformation(t);
-        }
-
-        private float snapRotation(float angle) {
-            // Доворачиваем до ближайшего кратного 90 градусам
-            float snapped = Math.round(angle / 90f) * 90f;
-            // Плавно интерполируем к нужному углу
-            if (Math.abs(snapped - angle) < 1f) {
-                return snapped;
-            }
-            return angle + Math.signum(snapped - angle) * 2f; // Скорость прилипания
-        }
-
-        private void calculateTipping(Location loc) {
-            World world = loc.getWorld();
-            Block centerBlock = world.getBlockAt(loc.clone().subtract(0, 0.5, 0));
-            
-            if (centerBlock.getType().isAir()) {
-                rotationSpeedPitch = (float) (Math.random() * 0.2 - 0.1);
-                rotationSpeedRoll = (float) (Math.random() * 0.2 - 0.1);
-                velocity.setY(-0.1);
+            // 5. Применение вращения
+            if (angularVelocity.lengthSquared() > 0.0001) {
+                Quaternionf dq = new Quaternionf().rotateXYZ(
+                        (float) Math.toRadians(angularVelocity.getX()),
+                        (float) Math.toRadians(angularVelocity.getY()),
+                        (float) Math.toRadians(angularVelocity.getZ())
+                );
+                rotation.mul(dq);
+                rotation.normalize();
+                updateTransformation();
             }
         }
 
-        private boolean collides(Location testLoc) {
-            World world = testLoc.getWorld();
-            BoundingBox box = getBoundingBox(testLoc);
+        private boolean resolveCollisions(Location nextLoc) {
+            World world = nextLoc.getWorld();
+            BoundingBox box = getBoundingBox(nextLoc);
+            boolean collided = false;
 
+            // Проверка с блоками мира
             int minX = (int) Math.floor(box.getMinX());
             int minY = (int) Math.floor(box.getMinY());
             int minZ = (int) Math.floor(box.getMinZ());
@@ -431,26 +390,106 @@ public class PhysicsListener implements Listener {
                         Block b = world.getBlockAt(x, y, z);
                         if (b.getType().isSolid()) {
                             BoundingBox blockBox = b.getBoundingBox();
-                            if (blockBox.overlaps(box)) return true;
+                            if (blockBox.overlaps(box)) {
+                                collided = true;
+                                
+                                // Вычисляем минимальный вектор выталкивания (MTV)
+                                Vector push = getOverlapPush(box, blockBox);
+                                
+                                // Применяем выталкивание
+                                nextLoc.add(push);
+                                box = getBoundingBox(nextLoc); // Обновляем хитбокс
+                                
+                                // Гасим скорость по нормали столкновения
+                                if (Math.abs(push.getY()) > Math.abs(push.getX()) && Math.abs(push.getY()) > Math.abs(push.getZ())) {
+                                    velocity.setY(0);
+                                    // Создаем угловой момент при падении на край
+                                    if (Math.random() < 0.3) {
+                                        angularVelocity.add(new Vector(
+                                                (Math.random() - 0.5) * 0.5,
+                                                (Math.random() - 0.5) * 0.5,
+                                                (Math.random() - 0.5) * 0.5
+                                        ));
+                                    }
+                                } else if (Math.abs(push.getX()) > Math.abs(push.getZ())) {
+                                    velocity.setX(velocity.getX() * -RESTITUTION);
+                                } else {
+                                    velocity.setZ(velocity.getZ() * -RESTITUTION);
+                                }
+                            }
                         }
                     }
                 }
             }
-
+            
+            // Проверка с другими физическими блоками
             for (PhysicsBlock other : activeBlocks.values()) {
                 if (other.uuid.equals(this.uuid)) continue;
-                if (other.display.isDead()) continue;
-                BoundingBox otherBox = other.getBoundingBox(other.display.getLocation());
+                BoundingBox otherBox = other.getBoundingBox(other.currentLoc);
                 if (otherBox.overlaps(box)) {
-                    Vector push = testLoc.toVector().subtract(other.display.getLocation().toVector());
-                    if (push.lengthSquared() > 0.0001) {
-                        push.normalize().multiply(0.08);
-                        velocity.add(push);
-                    }
-                    return true;
+                    collided = true;
+                    Vector push = getOverlapPush(box, otherBox);
+                    nextLoc.add(push);
+                    box = getBoundingBox(nextLoc);
+                    
+                    velocity.add(push.multiply(0.1));
+                    other.velocity.subtract(push.multiply(0.1));
+                    
+                    angularVelocity.add(new Vector(
+                        (Math.random() - 0.5) * 0.1,
+                        (Math.random() - 0.5) * 0.1,
+                        (Math.random() - 0.5) * 0.1
+                    ));
                 }
             }
-            return false;
+
+            return collided;
+        }
+
+        private Vector getOverlapPush(BoundingBox a, BoundingBox b) {
+            double dx1 = b.getMaxX() - a.getMinX();
+            double dx2 = a.getMaxX() - b.getMinX();
+            double dy1 = b.getMaxY() - a.getMinY();
+            double dy2 = a.getMaxY() - b.getMinY();
+            double dz1 = b.getMaxZ() - a.getMinZ();
+            double dz2 = a.getMaxZ() - b.getMinZ();
+
+            double minX = Math.min(dx1, dx2);
+            double minY = Math.min(dy1, dy2);
+            double minZ = Math.min(dz1, dz2);
+
+            if (minX < minY && minX < minZ) {
+                return new Vector(dx1 < dx2 ? -minX : minX, 0, 0);
+            } else if (minY < minZ) {
+                return new Vector(0, dy1 < dy2 ? -minY : minY, 0);
+            } else {
+                return new Vector(0, 0, dz1 < dz2 ? -minZ : minZ);
+            }
+        }
+
+        private void snapRotation() {
+            // Принудительное выравнивание по осям
+            float yaw = rotation.getEulerAnglesYXZ(new Vector3f()).y;
+            float pitch = rotation.getEulerAnglesYXZ(new Vector3f()).x;
+            float roll = rotation.getEulerAnglesYXZ(new Vector3f()).z;
+
+            pitch = Math.round(pitch / (float)(Math.PI/2)) * (float)(Math.PI/2);
+            roll = Math.round(roll / (float)(Math.PI/2)) * (float)(Math.PI/2);
+
+            rotation.identity().rotateYXZ(yaw, pitch, roll);
+            updateTransformation();
+        }
+
+        private void updateTransformation() {
+            Transformation t = display.getTransformation();
+            
+            // Компенсация смещения для вращения вокруг центра
+            Vector3f offset = new Vector3f(-0.5f, -0.5f, -0.5f);
+            rotation.transform(offset);
+            
+            t.getTranslation().set(offset);
+            t.getLeftRotation().set(rotation);
+            display.setTransformation(t);
         }
 
         void stopAndSnap() {
