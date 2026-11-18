@@ -5,6 +5,7 @@ import org.bukkit.block.Block;
 import org.bukkit.entity.BlockDisplay;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.player.PlayerInteractEvent;
@@ -22,12 +23,11 @@ public class PhysicsListener implements Listener {
 
     private final PhysicsRodPlugin plugin;
 
-    // Все активные физические блоки
     private final Map<UUID, PhysicsBlock> activeBlocks = new HashMap<>();
-    // Кто кого держит: playerUUID -> blockUUID
     private final Map<UUID, UUID> grabbedByPlayer = new HashMap<>();
-    // Кто кем управляет (для обратной связи)
-    private final Map<UUID, UUID> grabbedBlockOwner = new HashMap<>();
+    
+    // Храним задачи для ActionBar, чтобы не спамить чат
+    private final Map<UUID, BukkitRunnable> actionBarTasks = new HashMap<>();
 
     private static final double GRAVITY = -0.045;
     private static final double AIR_DRAG = 0.998;
@@ -39,6 +39,7 @@ public class PhysicsListener implements Listener {
 
     public PhysicsListener(PhysicsRodPlugin plugin) {
         this.plugin = plugin;
+        startActionBarTask();
     }
 
     public void cleanup() {
@@ -47,10 +48,35 @@ public class PhysicsListener implements Listener {
         }
         activeBlocks.clear();
         grabbedByPlayer.clear();
-        grabbedBlockOwner.clear();
+        for (BukkitRunnable task : actionBarTasks.values()) {
+            task.cancel();
+        }
+        actionBarTasks.clear();
     }
 
-    @EventHandler
+    // Задача для отображения подсказок над инвентарём
+    private void startActionBarTask() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                for (Player player : Bukkit.getOnlinePlayers()) {
+                    ItemStack hand = player.getInventory().getItemInMainHand();
+                    if (hand.getType() == Material.BREEZE_ROD && player.hasPermission("physicsrod.use")) {
+                        String msg;
+                        UUID uuid = player.getUniqueId();
+                        if (grabbedByPlayer.containsKey(uuid)) {
+                            msg = "§bУдерживается §7| §fЛКМ §7- Бросок §8| §fПКМ §7- Отпустить";
+                        } else {
+                            msg = "§bPhysics Rod §7| §fЛКМ §7- Создать/Вернуть §8| §fПКМ §7- Притянуть";
+                        }
+                        player.sendActionBar(msg);
+                    }
+                }
+            }
+        }.runTaskTimer(plugin, 0L, 10L); // Обновляем каждые полсекунды
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
     public void onInteract(PlayerInteractEvent event) {
         Player player = event.getPlayer();
         ItemStack hand = player.getInventory().getItemInMainHand();
@@ -58,69 +84,58 @@ public class PhysicsListener implements Listener {
         if (!player.hasPermission("physicsrod.use")) return;
 
         UUID playerId = player.getUniqueId();
+        Action action = event.getAction();
 
-        // === ЛКМ: создать / вернуть блок ===
-        if (event.getAction() == Action.LEFT_CLICK_BLOCK) {
-            event.setCancelled(true);
-            if (event.getClickedBlock() == null) return;
-
-            // Если игрок что-то держит — бросок
+        // Бросок или отпускание (ЛКМ и ПКМ в воздухе или по блоку)
+        if (action == Action.LEFT_CLICK_AIR || action == Action.LEFT_CLICK_BLOCK) {
             if (grabbedByPlayer.containsKey(playerId)) {
+                event.setCancelled(true);
                 PhysicsBlock grabbed = activeBlocks.get(grabbedByPlayer.get(playerId));
-                if (grabbed != null) {
-                    releaseBlock(player, grabbed, true);
-                }
+                if (grabbed != null) releaseBlock(player, grabbed, true);
                 return;
             }
-
-            // Если уже есть активный блок у игрока — вернуть его
-            PhysicsBlock owned = findOwnedBlock(playerId);
-            if (owned != null) {
-                owned.stopAndSnap();
-                activeBlocks.remove(owned.uuid);
-                player.sendMessage("§eBlock returned to grid.");
-                return;
+            
+            if (action == Action.LEFT_CLICK_BLOCK) {
+                event.setCancelled(true);
+                handleLeftClickBlock(player, event.getClickedBlock());
             }
-
-            // Создать новый физический блок
-            Block clicked = event.getClickedBlock();
-            Location spawnLoc = clicked.getLocation().add(0.5, 0.5, 0.5);
-            Material type = clicked.getType();
-
-            // Проверка, что тут ещё нет физического блока
-            for (PhysicsBlock pb : activeBlocks.values()) {
-                if (pb.display.getLocation().distanceSquared(spawnLoc) < 1.0) {
-                    player.sendMessage("§cThis block is already physical.");
-                    return;
-                }
-            }
-
-            clicked.setType(Material.AIR);
-            PhysicsBlock pb = createPhysicsBlock(spawnLoc, type, playerId);
-            activeBlocks.put(pb.uuid, pb);
-            player.sendMessage("§aBlock is now physical. LMB again to return, RMB to grab.");
             return;
         }
 
-        // === ПКМ: захват / отпускание / перетаскивание ===
-        if (event.getAction() == Action.RIGHT_CLICK_BLOCK || event.getAction() == Action.RIGHT_CLICK_AIR) {
+        if (action == Action.RIGHT_CLICK_AIR || action == Action.RIGHT_CLICK_BLOCK) {
             event.setCancelled(true);
-
-            // Если уже держим — отпускаем (без броска, просто падает)
             if (grabbedByPlayer.containsKey(playerId)) {
                 PhysicsBlock grabbed = activeBlocks.get(grabbedByPlayer.get(playerId));
-                if (grabbed != null) {
-                    releaseBlock(player, grabbed, false);
-                }
+                if (grabbed != null) releaseBlock(player, grabbed, false);
                 return;
             }
-
-            // Ищем ближайший физический блок в радиусе действия
             PhysicsBlock target = findNearestBlock(player);
             if (target != null && !target.isGrabbed()) {
                 grabBlock(player, target);
             }
         }
+    }
+
+    private void handleLeftClickBlock(Player player, Block clickedBlock) {
+        if (clickedBlock == null) return;
+        UUID playerId = player.getUniqueId();
+
+        PhysicsBlock owned = findOwnedBlock(playerId);
+        if (owned != null) {
+            owned.stopAndSnap();
+            return;
+        }
+
+        Location spawnLoc = clickedBlock.getLocation().add(0.5, 0.5, 0.5);
+        Material type = clickedBlock.getType();
+
+        for (PhysicsBlock pb : activeBlocks.values()) {
+            if (pb.display.getLocation().distanceSquared(spawnLoc) < 1.0) return;
+        }
+
+        clickedBlock.setType(Material.AIR);
+        PhysicsBlock pb = createPhysicsBlock(spawnLoc, type, playerId);
+        activeBlocks.put(pb.uuid, pb);
     }
 
     private PhysicsBlock findOwnedBlock(UUID playerId) {
@@ -143,7 +158,7 @@ public class PhysicsListener implements Listener {
             double dist = toBlock.length();
             if (dist > bestDist) continue;
             double dot = toBlock.normalize().dot(dir);
-            if (dot > 0.75) { // в пределах ~40 градусов от взгляда
+            if (dot > 0.75) {
                 best = pb;
                 bestDist = dist;
             }
@@ -156,23 +171,18 @@ public class PhysicsListener implements Listener {
         pb.grabbedBy = player.getUniqueId();
         pb.velocity = new Vector(0, 0, 0);
         grabbedByPlayer.put(player.getUniqueId(), pb.uuid);
-        grabbedBlockOwner.put(pb.uuid, player.getUniqueId());
-        player.sendMessage("§bBlock grabbed. RMB to drop, LMB to throw.");
     }
 
     private void releaseBlock(Player player, PhysicsBlock pb, boolean throwIt) {
         pb.grabbed = false;
         pb.grabbedBy = null;
         grabbedByPlayer.remove(player.getUniqueId());
-        grabbedBlockOwner.remove(pb.uuid);
 
         if (throwIt) {
             Vector dir = player.getEyeLocation().getDirection().normalize().multiply(1.6);
             pb.velocity = dir.add(new Vector(0, 0.15, 0));
-            player.sendMessage("§aBlock thrown!");
         } else {
             pb.velocity = new Vector(0, 0, 0);
-            player.sendMessage("§eBlock released.");
         }
     }
 
@@ -196,9 +206,6 @@ public class PhysicsListener implements Listener {
         return pb;
     }
 
-    /**
-     * Внутренний класс: физический блок с ручной симуляцией.
-     */
     private class PhysicsBlock {
         final UUID uuid = UUID.randomUUID();
         final BlockDisplay display;
@@ -207,8 +214,8 @@ public class PhysicsListener implements Listener {
         BukkitRunnable task;
 
         Vector velocity = new Vector(0, 0, 0);
-        float rotationAngle = 0f;      // накопленный угол наклона
-        float rotationSpeed = 0f;      // скорость вращения
+        float rotationAngle = 0f;
+        float rotationSpeed = 0f;
         boolean onGround = false;
         boolean grabbed = false;
         UUID grabbedBy = null;
@@ -253,13 +260,11 @@ public class PhysicsListener implements Listener {
             task.runTaskTimer(plugin, 0L, 1L);
         }
 
-        /** Логика удержания блока игроком (как физган) */
         private void handleGrab(Location loc) {
             Player holder = Bukkit.getPlayer(grabbedBy);
             if (holder == null || !holder.isOnline()) {
                 grabbed = false;
                 grabbedBy = null;
-                grabbedBlockOwner.remove(uuid);
                 return;
             }
 
@@ -267,7 +272,6 @@ public class PhysicsListener implements Listener {
             Vector dir = eye.getDirection().normalize();
             Location target = eye.clone().add(dir.multiply(GRAB_DISTANCE));
 
-            // Плавное движение к целевой точке
             Vector delta = target.toVector().subtract(loc.toVector());
             double dist = delta.length();
             if (dist > MAX_SPEED) {
@@ -279,37 +283,29 @@ public class PhysicsListener implements Listener {
             Location newLoc = loc.clone().add(delta);
             display.teleport(newLoc);
 
-            // Поворот блока вслед за взглядом (только по Y)
             float yaw = holder.getLocation().getYaw();
             Transformation t = display.getTransformation();
             t.getLeftRotation().set(new Quaternionf().rotateY((float) Math.toRadians(-yaw)));
             display.setTransformation(t);
 
-            // Сохраняем скорость для инерции при броске
             velocity = delta.multiply(0.6);
         }
 
-        /** Основная физика падения, коллизий и отталкивания */
         private void handlePhysics(Location loc) {
-            // Гравитация
             velocity.setY(velocity.getY() + GRAVITY);
 
-            // Ограничение скорости
             if (velocity.length() > MAX_SPEED * 1.5) {
                 velocity.normalize().multiply(MAX_SPEED * 1.5);
             }
 
-            // Применяем по осям отдельно для корректных коллизий
             Vector move = velocity.clone();
 
-            // --- Y ---
+            // Проверка по Y (вверх/вниз)
             if (move.getY() != 0) {
                 Location testY = loc.clone().add(0, move.getY(), 0);
                 if (collides(testY)) {
-                    // Приземление / удар головой
                     if (move.getY() < 0) {
                         onGround = true;
-                        // Добавляем вращение при падении на край (если движемся по X/Z)
                         float horizontalSpeed = (float) Math.sqrt(velocity.getX() * velocity.getX() + velocity.getZ() * velocity.getZ());
                         if (horizontalSpeed > 0.05 && Math.abs(rotationAngle) < 45f) {
                             rotationSpeed = horizontalSpeed * 8f;
@@ -323,7 +319,7 @@ public class PhysicsListener implements Listener {
                 }
             }
 
-            // --- X ---
+            // Проверка по X
             if (move.getX() != 0) {
                 Location testX = loc.clone().add(move.getX(), 0, 0);
                 if (collides(testX)) {
@@ -334,7 +330,7 @@ public class PhysicsListener implements Listener {
                 }
             }
 
-            // --- Z ---
+            // Проверка по Z
             if (move.getZ() != 0) {
                 Location testZ = loc.clone().add(0, 0, move.getZ());
                 if (collides(testZ)) {
@@ -345,7 +341,6 @@ public class PhysicsListener implements Listener {
                 }
             }
 
-            // Трение на земле
             if (onGround) {
                 velocity.setX(velocity.getX() * GROUND_FRICTION);
                 velocity.setZ(velocity.getZ() * GROUND_FRICTION);
@@ -355,13 +350,10 @@ public class PhysicsListener implements Listener {
                 velocity.multiply(AIR_DRAG);
             }
 
-            // Применяем позицию
             display.teleport(loc);
 
-            // --- Вращение ---
             if (Math.abs(rotationSpeed) > 0.01f) {
                 rotationAngle += rotationSpeed;
-                // Ограничиваем наклон, чтобы блок не улетал в космос
                 if (rotationAngle > 90f) { rotationAngle = 90f; rotationSpeed = 0; }
                 if (rotationAngle < -90f) { rotationAngle = -90f; rotationSpeed = 0; }
                 rotationSpeed *= 0.92f;
@@ -370,29 +362,25 @@ public class PhysicsListener implements Listener {
                 t.getLeftRotation().set(new Quaternionf().rotateX((float) Math.toRadians(rotationAngle)));
                 display.setTransformation(t);
             }
-
-            // Проверка на "успокоение" — если блок стоит на земле и скорость нулевая, можно не тикать
-            // (оставляем тик, чтобы можно было схватить и толкнуть)
         }
 
-        /** Проверка коллизий: мир + другие физические блоки */
         private boolean collides(Location testLoc) {
             World world = testLoc.getWorld();
             BoundingBox box = getBoundingBox(testLoc);
 
-            // Проверка с блоками мира
-            int minX = (int) Math.floor(box.getMinX());
-            int minY = (int) Math.floor(box.getMinY());
-            int minZ = (int) Math.floor(box.getMinZ());
-            int maxX = (int) Math.floor(box.getMaxX());
-            int maxY = (int) Math.floor(box.getMaxY());
-            int maxZ = (int) Math.floor(box.getMaxZ());
+            // Расширяем границы поиска блоков на 1, чтобы точно захватить все возможные пересечения
+            int minX = (int) Math.floor(box.getMinX()) - 1;
+            int minY = (int) Math.floor(box.getMinY()) - 1;
+            int minZ = (int) Math.floor(box.getMinZ()) - 1;
+            int maxX = (int) Math.floor(box.getMaxX()) + 1;
+            int maxY = (int) Math.floor(box.getMaxY()) + 1;
+            int maxZ = (int) Math.floor(box.getMaxZ()) + 1;
 
             for (int x = minX; x <= maxX; x++) {
                 for (int y = minY; y <= maxY; y++) {
                     for (int z = minZ; z <= maxZ; z++) {
                         Block b = world.getBlockAt(x, y, z);
-                        if (b.getType().isSolid()) {
+                        if (!b.getType().isAir() && b.getType().isSolid()) {
                             BoundingBox blockBox = b.getBoundingBox();
                             if (blockBox.overlaps(box)) return true;
                         }
@@ -400,13 +388,11 @@ public class PhysicsListener implements Listener {
                 }
             }
 
-            // Проверка с другими физическими блоками
             for (PhysicsBlock other : activeBlocks.values()) {
                 if (other.uuid.equals(this.uuid)) continue;
                 if (other.display.isDead()) continue;
                 BoundingBox otherBox = other.getBoundingBox(other.display.getLocation());
                 if (otherBox.overlaps(box)) {
-                    // Отталкивание от другого физического блока
                     Vector push = testLoc.toVector().subtract(other.display.getLocation().toVector());
                     if (push.lengthSquared() > 0.0001) {
                         push.normalize().multiply(0.08);
@@ -424,15 +410,13 @@ public class PhysicsListener implements Listener {
             Location loc = display.getLocation();
             World world = loc.getWorld();
 
-            // Ищем ближайшую свободную позицию для возврата блока
             int bx = loc.getBlockX();
             int by = loc.getBlockY();
             int bz = loc.getBlockZ();
 
-            // Пытаемся поставить в текущую или ближайшую свободную позицию
             for (int dy = 0; dy <= 3; dy++) {
                 Block target = world.getBlockAt(bx, by + dy, bz);
-                if (target.getType() == Material.AIR || !target.getType().isSolid()) {
+                if (target.getType().isAir() || !target.getType().isSolid()) {
                     target.setType(material);
                     break;
                 }
@@ -442,7 +426,6 @@ public class PhysicsListener implements Listener {
             activeBlocks.remove(uuid);
             if (grabbedBy != null) {
                 grabbedByPlayer.remove(grabbedBy);
-                grabbedBlockOwner.remove(uuid);
             }
         }
 
